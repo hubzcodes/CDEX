@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-CDEXSCOPE - single-file production bot (PTB v20 async)
+CDEXSCOPE — ALL-IN-ONE production bot (PTB v20)
 
-Features:
-- Helius WebSocket (SOL logsSubscribe) with auto-reconnect
-- DexScreener + Jupiter price lookups
+Full features:
+- Helius WS (logsSubscribe) with reconnection/backoff
+- DexScreener + Jupiter price + supply -> marketcap
 - On-chain LP decoding scaffold (Raydium/Orca heuristics)
-- SQLite persistence (seen_mints, alerts, muted)
-- Telegram (channel + admin) using python-telegram-bot v20 async
+- SQLite persistence (seen_mints, muted_mints, alerts, meta)
+- Admin commands via Telegram (mute/unmute/setmincap/rescan/stats/status/restart)
+- Premium message layout with inline buttons (Chart / Buy)
 - Rate limiting, dedupe, severity scoring v2
-- Admin commands: /mute, /unmute, /setmincap, /rescan, /stats, /status, /restart
-- Webhook forward (optional)
-- Local health/preview HTTP server (single-file)
-- Safe stubs for Redis/Postgres (no required deps)
+- Marketcap window filtering (44k - 100k)
+- Webhook forwarding (optional)
+- Embedded preview/health HTTP endpoint
+- Safe optional stubs for Redis/Postgres
+- All-in-one single-file
 """
 
 import os
@@ -25,29 +27,29 @@ import logging
 import asyncio
 import sqlite3
 import html
+import base64
+import struct
 from typing import Optional, Dict, Any, Set, List, Tuple
 from datetime import datetime, timezone
 
 import httpx
 import websockets
 
-# telegram
+# PTB v20 async
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 
 # -------------------------
-# Configuration (env)
+# Config from environment
 # -------------------------
 PROJECT = "CDEXSCOPE"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # REQUIRED
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003312132383")  # your channel id
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # required
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003312132383")
 TELEGRAM_ADMIN_CHAT = os.getenv("TELEGRAM_ADMIN_CHAT", "8066430050")
 
 HELIUS_KEY = os.getenv("HELIUS_KEY", "")
@@ -64,13 +66,11 @@ ALERTS_PER_MINUTE = int(os.getenv("ALERTS_PER_MINUTE", "6"))
 ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "600"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DB_FILE = os.getenv("CDEX_DB_FILE", "cdexscope.db")
-WEBHOOK_FORWARD_URL = os.getenv("WEBHOOK_FORWARD_URL", "")  # optional
+WEBHOOK_FORWARD_URL = os.getenv("WEBHOOK_FORWARD_URL", "")
 
-# Optional scaling (stubs)
 REDIS_URL = os.getenv("REDIS_URL", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Tunables
 MAX_WS_BACKOFF = 60
 RECHECK_INTERVAL_SECONDS = 60
 RESEND_SEVERITY_INCREASE = 15.0
@@ -86,7 +86,7 @@ logging.basicConfig(
 log = logging.getLogger(PROJECT)
 
 # -------------------------
-# HTTPX Async client (shared)
+# Shared HTTPX client
 # -------------------------
 _http_client: Optional[httpx.AsyncClient] = None
 
@@ -205,30 +205,27 @@ def db_get_recent_alerts(limit: int = 20) -> List[Dict[str, Any]]:
 # -------------------------
 # Telegram helpers (PTB v20)
 # -------------------------
-TG_APP = None  # Application instance will be stored here
+TG_APP = None  # will be set to Application instance
 
 
 async def tg_send_text(text: str, chat_id: Optional[str] = None, buttons: Optional[List[Tuple[str, str]]] = None) -> bool:
-    """
-    Send message using the PTB Application's bot asynchronously.
-    """
     global TG_APP
     if TG_APP is None:
         log.warning("tg_send_text: TG_APP not initialized")
         return False
     target = int(chat_id) if chat_id is not None and str(chat_id).lstrip("-").isdigit() else int(TELEGRAM_CHAT_ID)
-    # Message is already HTML formatted; avoid double-escaping so admins can pass <b>/<code> markup.
     reply_markup = None
     if buttons:
         keyboard = [[InlineKeyboardButton(label, url=url)] for label, url in buttons]
         reply_markup = InlineKeyboardMarkup(keyboard)
     try:
+        # text expected to contain HTML tags (we produce HTML in format_premium_message)
         await TG_APP.bot.send_message(chat_id=target, text=text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=reply_markup)
-        log.debug("tg_send_text: sent to %s", target)
+        log.debug("tg_send_text sent to %s", target)
         return True
     except Exception as e:
         log.exception("tg_send_text failed: %s", e)
-        # send diagnostic to admin if possible
+        # diagnostic to admin
         try:
             if TELEGRAM_ADMIN_CHAT and int(TELEGRAM_ADMIN_CHAT) != target:
                 await TG_APP.bot.send_message(chat_id=int(TELEGRAM_ADMIN_CHAT), text=f"[CDEXSCOPE DIAG] failed to send to {target}: {e}")
@@ -247,7 +244,7 @@ async def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        log.debug("http_get_json failed %s %s", url, e)
+        log.debug("http_get_json %s failed: %s", url, e)
         return None
 
 
@@ -326,12 +323,8 @@ async def jupiter_price_in_usdc(mint: str) -> Optional[float]:
 
 
 # -------------------------
-# LP decoders (scaffold)
+# LP decoding scaffold (Raydium/Orca)
 # -------------------------
-import base64
-import struct
-
-
 async def _rpc_get_account_info(pubkey: str) -> Optional[dict]:
     try:
         res = await solana_rpc("getAccountInfo", [pubkey, {"encoding": "base64", "commitment": "confirmed"}])
@@ -344,7 +337,8 @@ async def _try_decode_pool_from_account_data(b64: str) -> Optional[Dict[str, flo
     try:
         raw = base64.b64decode(b64)
         L = len(raw)
-        for i in range(0, min(128, L - 16), 4):
+        # Heuristic scanning for two u64 reserves: Conservative approach
+        for i in range(0, min(256, L - 16), 4):
             try:
                 a = struct.unpack_from("<Q", raw, i)[0]
                 b = struct.unpack_from("<Q", raw, i + 8)[0]
@@ -358,6 +352,7 @@ async def _try_decode_pool_from_account_data(b64: str) -> Optional[Dict[str, flo
 
 
 async def get_best_pool_price_and_liquidity_onchain(mint: str) -> Optional[Dict[str, Any]]:
+    # Try DexScreener first (fast)
     ds = await dexscreener_for_mint(mint)
     if ds and isinstance(ds, dict) and ds.get("pairs"):
         for p in ds["pairs"]:
@@ -369,23 +364,26 @@ async def get_best_pool_price_and_liquidity_onchain(mint: str) -> Optional[Dict[
             except Exception:
                 continue
 
-    candidates = []
+    # Fallback: scan candidate pool accounts (left empty — implement targeted lookup if you want)
+    candidates: List[str] = []
     for acct in candidates:
         info = await _rpc_get_account_info(acct)
         if info and info.get("value") and info["value"].get("data"):
             b64 = info["value"]["data"][0]
             decode = await _try_decode_pool_from_account_data(b64)
             if decode:
-                r_a, r_b = decode["reserve_a"], decode["reserve_b"]
+                r_a = decode["reserve_a"]
+                r_b = decode["reserve_b"]
                 if r_a > 0 and r_b > 0:
+                    # assume other reserve is USDC-like
                     price = r_b / r_a
-                    liquidity_usd = (r_b * 1.0)
+                    liquidity_usd = r_b
                     return {"price": float(price), "liquidity": float(liquidity_usd)}
     return None
 
 
 # -------------------------
-# Anti-rug scoring
+# Anti-rug heuristics & severity
 # -------------------------
 async def compute_top_holder_pct(mint: str) -> Optional[float]:
     largest = await get_token_largest_accounts(mint)
@@ -458,11 +456,11 @@ def severity_score_v2(mcap: Optional[float], liquidity: Optional[float], top_pct
 
 
 # -------------------------
-# Premium message formatting
+# Message formatting
 # -------------------------
 def format_premium_message(mint: str, created_iso: Optional[str], mcap: Optional[float], price: Optional[float],
                            top_pct: Optional[float], risk_label: str, severity: float, trigger_tx: Optional[str]) -> Tuple[str, List[Tuple[str, str]]]:
-    created_line = created_iso or "unknown"
+    created_line = created_iso or datetime.now(timezone.utc).isoformat()
     mcap_line = f"${mcap:,.0f}" if mcap else "<i>unknown</i>"
     price_line = f"${price:.10f}" if price else "<i>unknown</i>"
     top_holder_line = f"{top_pct:.1f}%" if top_pct is not None else "unknown"
@@ -484,13 +482,15 @@ def format_premium_message(mint: str, created_iso: Optional[str], mcap: Optional
         f"🛒 <a href=\"https://jup.ag/swap/SOL-{mint}\">Buy</a>",
         "━━━━━━━━━━━━━━━━━━━━━━",
     ]
+    if trigger_tx:
+        lines.append(f"Trigger tx: <code>{trigger_tx}</code>")
     text = "\n".join(lines)
     buttons = [("🛒 Buy on Jupiter", f"https://jup.ag/swap/SOL-{mint}"), ("📈 Chart", f"https://dexscreener.com/solana/{mint}")]
     return text, buttons
 
 
 # -------------------------
-# Dedupe & rate limiter
+# Rate limiting + dedupe
 # -------------------------
 _seen_local: Set[str] = set()
 _alerted_cache: Dict[str, float] = {}
@@ -532,7 +532,7 @@ async def forward_webhook(payload: dict) -> None:
 
 
 # -------------------------
-# Core analyze pipeline
+# Analyzer pipeline
 # -------------------------
 async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
     try:
@@ -561,7 +561,7 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
         price = None
         liquidity = None
 
-        # DexScreener
+        # 1) DexScreener
         ds = await dexscreener_for_mint(mint)
         if ds and isinstance(ds, dict) and ds.get("pairs"):
             for p in ds["pairs"]:
@@ -586,7 +586,7 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
                 except Exception:
                     continue
 
-        # Jupiter fallback + supply
+        # 2) Jupiter price + supply -> mcap
         if mcap is None:
             jp = await jupiter_price_in_usdc(mint)
             if jp is not None:
@@ -600,7 +600,7 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
                         mcap = total_supply * jp
                         price = jp
 
-        # On-chain pool fallback
+        # 3) On-chain fallback for price/liquidity
         if (mcap is None or liquidity is None) and (price is None or liquidity is None):
             oc = await get_best_pool_price_and_liquidity_onchain(mint)
             if oc:
@@ -621,7 +621,7 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
         top_pct = await compute_top_holder_pct(mint)
         sev = severity_score_v2(mcap, liquidity, top_pct, age_seconds)
 
-        # Marketcap window check
+        # enforce marketcap window
         if mcap is not None:
             if not (MIN_MARKET_CAP_USD <= mcap <= MAX_MARKET_CAP_USD):
                 log.info("mint %s mcap %s outside window %s-%s -> skip", mint, mcap, MIN_MARKET_CAP_USD, MAX_MARKET_CAP_USD)
@@ -653,13 +653,14 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
 
 
 # -------------------------
-# Websocket processing
+# Websocket event processing
 # -------------------------
 async def _process_logs_result(result: Dict[str, Any]) -> None:
     try:
         logs = result.get("logs", [])
         signature = result.get("signature")
         joined = " ".join(logs)
+        # Basic filter for mint creation events
         if "InitializeMint" not in joined and "MintTo" not in joined and "create_account" not in joined:
             return
         candidates = set()
@@ -707,7 +708,7 @@ async def websocket_loop() -> None:
 
 
 # -------------------------
-# Periodic rechecker
+# Periodic rechecker (resend if severity increases)
 # -------------------------
 async def periodic_rechecker() -> None:
     while True:
@@ -750,7 +751,7 @@ async def periodic_rechecker() -> None:
 
 
 # -------------------------
-# Telegram admin handlers (PTB command handlers)
+# Admin command handlers (PTB commands)
 # -------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("CDEXSCOPE bot active.")
@@ -836,7 +837,7 @@ async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------
-# Tiny HTTP preview (health + recent alerts)
+# Tiny HTTP preview/health server
 # -------------------------
 async def _handle_http_preview(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
@@ -889,12 +890,20 @@ async def main() -> None:
     log.info("Starting %s single-file bot", PROJECT)
     init_db()
 
+    # Apply stored override
+    mm = db_get_meta("min_marketcap")
+    if mm:
+        try:
+            global MIN_MARKET_CAP_USD
+            MIN_MARKET_CAP_USD = float(mm)
+        except Exception:
+            pass
+
     # PTB Application
     if TELEGRAM_TOKEN:
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
         TG_APP = app
-
-        # command handlers
+        # register handlers
         app.add_handler(CommandHandler("start", start_cmd))
         app.add_handler(CommandHandler("mute", mute_cmd))
         app.add_handler(CommandHandler("unmute", unmute_cmd))
@@ -904,7 +913,7 @@ async def main() -> None:
         app.add_handler(CommandHandler("status", status_cmd))
         app.add_handler(CommandHandler("restart", restart_cmd))
 
-        # start app in background
+        # initialize/start in background (non-blocking)
         await app.initialize()
         await app.start()
         log.info("Telegram application started")
@@ -919,14 +928,12 @@ async def main() -> None:
     except Exception:
         log.exception("startup heartbeat failed")
 
-    # create background tasks
+    # background tasks
     tasks = [
         asyncio.create_task(websocket_loop()),
         asyncio.create_task(periodic_rechecker()),
         asyncio.create_task(start_preview_server()),
     ]
-    # if telegram polling getUpdates needed, we have admin handlers in PTB, no extra poller required
-
     await asyncio.gather(*tasks)
 
 
