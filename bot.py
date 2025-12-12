@@ -1,8 +1,9 @@
 """
-CDEXSCOPE - bot.py (updated to avoid aiohttp compilation issues)
-Uses: httpx (async HTTP), websockets (async WS)
+CDEXSCOPE - bot.py (updated to include a tiny HTTP listener so Render web services see an open port)
 
-Note: this version removes aiohttp to avoid build failures on Render.
+- Uses httpx and websockets for RPC/WS.
+- Adds a minimal HTTP health endpoint bound to $PORT (or 10000) using asyncio.start_server.
+- Keeps previous logic (websocket monitor) unchanged.
 """
 
 import os
@@ -18,8 +19,8 @@ from datetime import datetime, timezone
 PROJECT_NAME = "CDEXSCOPE"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-SOLANA_WS_URL = os.getenv("SOLANA_WS_URL", "wss://api.mainnet-beta.solana.com")
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY")
+SOLANA_WS_URL = os.getenv("SOLANA_WS_URL", "wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY")
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "50000"))
 MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", str(2*3600)))
 ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "600"))
@@ -73,7 +74,7 @@ async def solana_rpc(method: str, params=None, timeout=20) -> Any:
             await asyncio.sleep(1)
     raise RuntimeError(f"RPC call {method} failed after retries")
 
-# Helpers
+# Helpers (same as before)
 async def get_token_mint_creation_slot(mint_address: str) -> Optional[int]:
     try:
         res = await solana_rpc("getSignaturesForAddress", [mint_address, {"limit": 20}])
@@ -94,7 +95,6 @@ async def get_block_time(slot: int) -> Optional[int]:
         return None
 
 async def estimate_marketcap_usd(mint_address: str) -> Optional[float]:
-    # Placeholder for better pool parsing. Returning None keeps logic conservative.
     try:
         supply_res = await solana_rpc("getTokenSupply", [mint_address])
         if not supply_res:
@@ -157,11 +157,13 @@ async def alert_token(mint_address: str, info: Dict[str,Any]):
     text = "\n".join(lines)
     await telegram_send(text)
 
+# Websocket monitor (same subscription logic as before)
 async def handle_ws():
     logging.info("Connecting to SOL websocket %s", SOLANA_WS_URL)
     backoff = 1
     while True:
         try:
+            # If your provider requires headers, set extra_headers={"Authorization": "Bearer ..."}
             async with websockets.connect(SOLANA_WS_URL, ping_interval=30, max_size=None) as ws:
                 logging.info("Websocket connected")
                 subscribe_msg = {"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":["all", {"commitment":"confirmed"}]}
@@ -218,9 +220,63 @@ async def process_candidate_token(mint_address: str):
     }
     await alert_token(mint_address, info)
 
+# -----------------------------
+# Minimal HTTP listener to satisfy Render's port check
+# -----------------------------
+async def _handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """
+    Very small HTTP responder. Responds 200 OK to any incoming connection.
+    """
+    try:
+        # read a small chunk to consume the request (no parsing needed)
+        data = await reader.read(1024)
+        if not data:
+            writer.close()
+            await writer.wait_closed()
+            return
+        body = b"OK"
+        response = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n"
+            b"\r\n" + body
+        )
+        writer.write(response)
+        await writer.drain()
+    except Exception:
+        # ignore errors on the health endpoint
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+async def start_health_server():
+    """
+    Start a TCP listener bound to Render's $PORT (or 10000).
+    Keep the server running in background so Render detects an open port.
+    """
+    port = int(os.getenv("PORT", os.getenv("RENDER_PORT", "10000")))
+    try:
+        server = await asyncio.start_server(_handle_tcp_client, host="0.0.0.0", port=port)
+        addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
+        logging.info("Health HTTP listener started on %s", addrs)
+        # Keep server running forever in background
+        async with server:
+            await server.serve_forever()
+    except Exception as e:
+        logging.exception("Health server failed to start: %s", e)
+
+# Main: run both health server and websocket monitor concurrently
 async def main():
     logging.info(f"Starting {PROJECT_NAME} memecoin monitor bot")
-    await handle_ws()
+    # Launch health server and websocket monitor in parallel
+    ws_task = asyncio.create_task(handle_ws())
+    health_task = asyncio.create_task(start_health_server())
+    await asyncio.gather(ws_task, health_task)
 
 if __name__ == "__main__":
     try:
