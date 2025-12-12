@@ -1,19 +1,23 @@
 # bot.py
 """
-CDEXSCOPE - production-grade single-file implementation
+CDEXSCOPE — production-grade single-file bot.
 
-Features:
-- Helius websocket with auto-reconnect/backoff/jitter
-- Jupiter price API primary for USD quotes (fast & reliable)
-- Best-effort on-chain LP parser scaffold (extendable)
-- Marketcap estimate and filtering
-- Anti-rug heuristics (top-holder %, LP token checks)
-- SQLite persistence (seen_mints, muted, alerts, meta)
-- Admin commands via Telegram polling: /mute, /unmute, /setmincap, /status, /debug
-- Severity scoring + per-minute rate limiting
-- Safe Telegram escaping and retries
-- Minimal HTTP health endpoint (for Render web service)
-- Clean structured logging
+Drop this file into your repo and deploy to Render (or run locally).
+Set TELEGRAM_TOKEN in environment before running.
+
+Environment variables (recommended to set in Render):
+- TELEGRAM_TOKEN (required)
+- TELEGRAM_CHAT_ID (default set below to your channel: -1003312132383)
+- TELEGRAM_ADMIN_CHAT (default your DM admin: 8066430050)
+- HELIUS_KEY (recommended)
+- SOLANA_WS_URL (optional; defaults to Helius)
+- SOLANA_RPC_URL (optional; defaults to Helius)
+- MIN_MARKET_CAP_USD (optional)
+- MAX_TOKEN_AGE_SECONDS (optional)
+- ALERTS_PER_MINUTE (optional)
+- ALERT_DEDUPE_SECONDS (optional)
+- LOG_LEVEL (optional, DEBUG/INFO)
+- CDEX_DB_FILE (optional)
 """
 import os
 import sys
@@ -32,36 +36,31 @@ import httpx
 import websockets
 
 # -------------------------
-# Configuration / defaults
+# Configuration defaults
 # -------------------------
 PROJECT = "CDEXSCOPE"
 
-# Required secrets (set as env vars in Render)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # admin chat id for replies
-HELIUS_KEY = os.getenv("HELIUS_KEY", "")
+# Secrets — set TELEGRAM_TOKEN in Render
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # REQUIRED
+# Default to your provided channel id — change in env if you want notifications somewhere else
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003312132383")
+# Admin who can run /mute /unmute /setmincap — default to the DM id you gave earlier
+TELEGRAM_ADMIN_CHAT = os.getenv("TELEGRAM_ADMIN_CHAT", "8066430050")
 
+HELIUS_KEY = os.getenv("HELIUS_KEY", "")
 SOLANA_WS_URL = os.getenv("SOLANA_WS_URL", f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}")
 
-# Jupiter quote API for price estimates (no key)
-JUPITER_PRICE_API = "https://quote-api.jup.ag/v1/price"
+JUPITER_PRICE_API = os.getenv("JUPITER_PRICE_API", "https://quote-api.jup.ag/v1/price")
+USDC_MINT = os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1zN7K4m3o8fM7k8UXfJv")
 
-# stable coin mint to quote against (USDC mainnet)
-USDC_MINT = os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1zN7K4m3o8fM7k8UXfJv")  # standard mainnet USDC
-
-# thresholds
+# Tunables
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "50000"))
 MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", str(2 * 3600)))
-ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "600"))
 ALERTS_PER_MINUTE = int(os.getenv("ALERTS_PER_MINUTE", "6"))
-
+ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "600"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# Token program id (canonical)
-TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-
-# sqlite db file
 DB_FILE = os.getenv("CDEX_DB_FILE", "cdexscope.db")
 
 # -------------------------
@@ -75,7 +74,7 @@ logging.basicConfig(
 log = logging.getLogger(PROJECT)
 
 # -------------------------
-# httpx async client
+# httpx Async client
 # -------------------------
 _http_client: Optional[httpx.AsyncClient] = None
 
@@ -86,11 +85,10 @@ def get_http_client() -> httpx.AsyncClient:
         _http_client = httpx.AsyncClient(timeout=20.0)
     return _http_client
 
+
 # -------------------------
 # SQLite persistence
 # -------------------------
-
-
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -103,13 +101,7 @@ def init_db():
         );
         """
     )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS muted_mints (
-            mint TEXT PRIMARY KEY
-        );
-        """
-    )
+    cur.execute("CREATE TABLE IF NOT EXISTS muted_mints (mint TEXT PRIMARY KEY);")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS alerts (
@@ -120,14 +112,7 @@ def init_db():
         );
         """
     )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS meta (
-            k TEXT PRIMARY KEY,
-            v TEXT
-        );
-        """
-    )
+    cur.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);")
     conn.commit()
     conn.close()
 
@@ -195,16 +180,25 @@ def db_set_meta(k: str, v: str):
     conn.close()
 
 
+def db_get_muted_list() -> Set[str]:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT mint FROM muted_mints")
+    rows = cur.fetchall()
+    conn.close()
+    return set(r[0] for r in rows)
+
+
 # -------------------------
 # Telegram helpers (safe)
 # -------------------------
-async def telegram_send_raw(text: str) -> bool:
+async def telegram_send(text: str) -> bool:
     """
-    Send message to TELEGRAM_CHAT_ID, escaping HTML entities to avoid Markdown parsing errors.
-    Returns True on success.
+    HTML-escape and send to TELEGRAM_CHAT_ID (the channel by default)
+    Retries and logs failures.
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram token/chat not configured; message suppressed.")
+        log.warning("Telegram not configured (TELEGRAM_TOKEN/TELEGRAM_CHAT_ID).")
         return False
 
     safe = html.escape(text)
@@ -216,9 +210,10 @@ async def telegram_send_raw(text: str) -> bool:
             if r.status_code == 200:
                 return True
             else:
-                log.warning("telegram_send_raw failed status=%s body=%s", r.status_code, await r.aread())
+                body = await r.aread()
+                log.warning("telegram_send failed status=%s body=%s", r.status_code, body)
         except Exception as e:
-            log.exception("telegram_send_raw exception: %s", e)
+            log.exception("telegram_send exception: %s", e)
         await asyncio.sleep(1 + attempt * 2)
     return False
 
@@ -240,7 +235,7 @@ async def telegram_get_updates(offset: Optional[int] = None) -> Dict[str, Any]:
 
 
 # -------------------------
-# Rate limiting
+# Rate limiting + counters
 # -------------------------
 _alert_counter = {"minute": None, "count": 0}
 
@@ -282,26 +277,21 @@ async def solana_rpc(method: str, params=None, timeout=15) -> Any:
     raise RuntimeError(f"solana_rpc {method} failed after retries")
 
 
-# helper: get token supply dict or None
 async def get_token_supply(mint: str) -> Optional[Dict[str, Any]]:
     try:
         return await solana_rpc("getTokenSupply", [mint])
-    except Exception as e:
-        log.debug("get_token_supply failed: %s", e)
+    except Exception:
         return None
 
 
-# helper: get largest accounts
 async def get_token_largest_accounts(mint: str) -> Optional[Any]:
     try:
         res = await solana_rpc("getTokenLargestAccounts", [mint])
         return res.get("value") if isinstance(res, dict) else res
-    except Exception as e:
-        log.debug("get_token_largest_accounts failed: %s", e)
+    except Exception:
         return None
 
 
-# helper: infer creation ts via signatures -> block time
 async def infer_creation_ts(mint: str) -> Optional[int]:
     try:
         sigs = await solana_rpc("getSignaturesForAddress", [mint, {"limit": 40}])
@@ -313,8 +303,7 @@ async def infer_creation_ts(mint: str) -> Optional[int]:
             return None
         bt = await solana_rpc("getBlockTime", [slot])
         return bt
-    except Exception as e:
-        log.debug("infer_creation_ts failed: %s", e)
+    except Exception:
         return None
 
 
@@ -322,78 +311,37 @@ async def infer_creation_ts(mint: str) -> Optional[int]:
 # Price & marketcap estimation
 # -------------------------
 async def jupiter_price_in_usdc(mint: str) -> Optional[float]:
-    """
-    Query Jupiter quote API for price of 1 token in USDC.
-    Returns float price or None.
-    """
     try:
         client = get_http_client()
         params = {"inputMint": mint, "outputMint": USDC_MINT}
         r = await client.get(JUPITER_PRICE_API, params=params, timeout=8.0)
         if r.status_code != 200:
-            log.debug("jupiter returned %s", r.status_code)
             return None
         data = r.json()
-        # Jupiter API returns {"price": <float>, ...}
         price = data.get("price") or data.get("data", {}).get("price")
         if price:
             return float(price)
-    except Exception as e:
-        log.debug("jupiter_price_in_usdc error: %s", e)
+    except Exception:
+        return None
     return None
 
 
 async def estimate_marketcap_usd(mint: str) -> Optional[float]:
-    """
-    Try Jupiter price first. If fails, attempt on-chain LP parse (best-effort).
-    Returns marketcap in USD or None.
-    """
-    # 1) get supply (amount & decimals)
-    try:
-        supply_res = await get_token_supply(mint)
-        if not supply_res:
-            return None
-        val = supply_res.get("value", {})
-        amount = float(val.get("amount", 0))
-        decimals = int(val.get("decimals") or 0)
-        if decimals:
-            total_supply = amount / (10 ** decimals)
-        else:
-            total_supply = amount
-    except Exception as e:
-        log.debug("estimate_marketcap: supply error %s", e)
+    # supply
+    supply_res = await get_token_supply(mint)
+    if not supply_res:
         return None
+    val = supply_res.get("value", {})
+    amount = float(val.get("amount", 0))
+    decimals = int(val.get("decimals") or 0)
+    total_supply = amount / (10 ** decimals) if decimals else amount
 
-    # 2) Jupiter -> price
+    # price via Jupiter
     price = await jupiter_price_in_usdc(mint)
     if price:
-        try:
-            return total_supply * price
-        except Exception:
-            return None
+        return total_supply * price
 
-    # 3) fallback: try on-chain LP parse (best-effort)
-    price2 = await estimate_price_from_lp_onchain(mint)
-    if price2:
-        return total_supply * price2
-
-    return None
-
-
-# -------------------------
-# On-chain LP parsing (best-effort)
-# -------------------------
-async def estimate_price_from_lp_onchain(mint: str) -> Optional[float]:
-    """
-    Best-effort attempt to find a token-USDC LP and compute price = USDC_reserve / token_reserve.
-
-    NOTE: Parsing Raydium/Orca LP accounts reliably requires DEX-specific decoding.
-    This helper is a conservative attempt:
-      - scans getProgramAccounts for token program? Not feasible here without custom decoding.
-    For production-grade on-chain parsing, we should implement dedicated parsers per DEX (Raydium, Orca v2/v3, etc.)
-    I return None here by default (Jupiter is the primary method).
-    """
-    # TODO: implement Raydium/Orca pool parsing here (complex; available on request)
+    # fallback placeholder (on-chain LP parsing not implemented here)
     return None
 
 
@@ -401,25 +349,21 @@ async def estimate_price_from_lp_onchain(mint: str) -> Optional[float]:
 # Anti-rug heuristics & scoring
 # -------------------------
 async def compute_top_holder_pct(mint: str) -> Optional[float]:
-    try:
-        largest = await get_token_largest_accounts(mint)
-        supply_res = await get_token_supply(mint)
-        if not largest or not supply_res:
-            return None
-        total_amount = float(supply_res.get("value", {}).get("amount", 0))
-        top_amount = float(largest[0].get("amount", 0))
-        if total_amount == 0:
-            return None
-        pct = (top_amount / total_amount) * 100.0
-        return pct
-    except Exception as e:
-        log.debug("compute_top_holder_pct error: %s", e)
+    largest = await get_token_largest_accounts(mint)
+    if not largest:
         return None
+    supply = await get_token_supply(mint)
+    if not supply:
+        return None
+    total_amount = float(supply.get("value", {}).get("amount", 0))
+    top_amount = float(largest[0].get("amount", 0))
+    if total_amount == 0:
+        return None
+    return (top_amount / total_amount) * 100.0
 
 
 def compute_severity(marketcap: Optional[float], top_pct: Optional[float], age_seconds: Optional[int]) -> float:
     score = 0.0
-    # marketcap
     if marketcap is None:
         score += 25.0
     else:
@@ -432,7 +376,6 @@ def compute_severity(marketcap: Optional[float], top_pct: Optional[float], age_s
         else:
             score += max(0.0, 5.0 - math.log10(max(marketcap, 1.0)))
 
-    # top holder
     if top_pct is not None:
         if top_pct > 50:
             score += 30.0
@@ -441,7 +384,6 @@ def compute_severity(marketcap: Optional[float], top_pct: Optional[float], age_s
         elif top_pct > 10:
             score += 5.0
 
-    # age
     if age_seconds is not None:
         if age_seconds < 300:
             score += 20.0
@@ -471,86 +413,66 @@ def should_alert_dedupe(mint: str) -> bool:
 
 async def analyze_and_alert(mint: str, triggering_sig: Optional[str]):
     if not should_alert_dedupe(mint):
-        log.debug("deduped %s", mint)
+        log.debug("Deduped %s", mint)
         return
 
-    # persist seen
     created_ts = await infer_creation_ts(mint)
     db_upsert_seen(mint, created_ts)
 
-    # muted?
     if db_is_muted(mint):
-        log.info("mint %s muted - skipping", mint)
+        log.info("Mint %s is muted; skipping", mint)
         return
 
-    # age
     age_seconds = None
     if created_ts:
         age_seconds = int(time.time() - created_ts)
         if age_seconds > MAX_TOKEN_AGE_SECONDS:
-            log.info("mint %s is older than %s seconds (%s) - skipping", mint, MAX_TOKEN_AGE_SECONDS, age_seconds)
+            log.info("Mint %s older than threshold (%s), skipping", mint, age_seconds)
             return
 
-    # estimate marketcap
-    try:
-        marketcap = await estimate_marketcap_usd(mint)
-    except Exception as e:
-        log.debug("marketcap estimate error: %s", e)
-        marketcap = None
-
+    marketcap = await estimate_marketcap_usd(mint)
     if marketcap is not None and marketcap > MIN_MARKET_CAP_USD:
-        log.info("mint %s marketcap $%s above threshold %s - skip", mint, marketcap, MIN_MARKET_CAP_USD)
+        log.info("Mint %s marketcap $%s above threshold (min=%s), skipping", mint, marketcap, MIN_MARKET_CAP_USD)
         return
 
     top_pct = await compute_top_holder_pct(mint)
     severity = compute_severity(marketcap, top_pct, age_seconds)
 
-    # rate limit global
     if not can_send_alert():
-        log.info("global rate limit reached - skipping alert for %s", mint)
+        log.info("Global rate limit reached, skipping %s", mint)
         return
 
-    # compose message (HTML-escaped later by send)
-    lines = []
-    lines.append(f"<b>{PROJECT} Alert</b>")
-    lines.append(f"<code>{mint}</code>")
+    lines = [f"<b>{PROJECT} Alert</b>", f"<code>{mint}</code>"]
     if created_ts:
         lines.append(f"Created: {datetime.fromtimestamp(created_ts, tz=timezone.utc).isoformat()}")
-    if marketcap:
-        lines.append(f"Estimated marketcap: ${marketcap:,.0f}")
-    else:
-        lines.append("Estimated marketcap: <i>unknown</i>")
-
+    lines.append(f"Marketcap: ${marketcap:,.0f}" if marketcap else "Marketcap: <i>unknown</i>")
     if top_pct is not None:
         lines.append(f"Top holder: {top_pct:.1f}%")
         if top_pct > 40.0:
             lines.append("<b>Flag: top holder >40% (high rug risk)</b>")
-
     lines.append(f"Severity: <b>{severity:.0f}/100</b>")
     if triggering_sig:
         lines.append(f"Trigger tx: <code>{triggering_sig}</code>")
 
     body = "\n".join(lines)
-    ok = await telegram_send_raw(body)
+    ok = await telegram_send(body)
     if ok:
-        log.info("alert sent for %s sev=%s", mint, severity)
         db_record_alert(mint, severity)
+        log.info("Alert sent for %s severity=%s", mint, severity)
     else:
-        log.warning("failed to send alert for %s", mint)
+        log.warning("Failed to send alert for %s", mint)
 
 
 # -------------------------
-# Websocket subscription & processing
+# Websocket processing
 # -------------------------
 async def process_logs_result(result: Dict[str, Any]):
     try:
         logs = result.get("logs", [])
         signature = result.get("signature")
         joined = " ".join(logs)
-        # early exit if nothing interesting
         if "InitializeMint" not in joined and "MintTo" not in joined and "create_account" not in joined:
             return
-        # find candidate base58-like tokens
         candidates = set()
         for token in joined.split():
             if 42 <= len(token) <= 44 and all(c.isalnum() or c in "-_" for c in token):
@@ -559,7 +481,7 @@ async def process_logs_result(result: Dict[str, Any]):
             if t in _seen_local:
                 continue
             _seen_local.add(t)
-            log.info("candidate mint detected %s sig=%s", t, signature)
+            log.info("Candidate mint detected %s sig=%s", t, signature)
             asyncio.create_task(analyze_and_alert(t, signature))
     except Exception as e:
         log.exception("process_logs_result error: %s", e)
@@ -569,12 +491,11 @@ async def websocket_loop():
     backoff = 1
     while True:
         try:
-            log.info("connecting to SOL WS: %s", SOLANA_WS_URL)
+            log.info("Connecting to SOL WS %s", SOLANA_WS_URL)
             async with websockets.connect(SOLANA_WS_URL, ping_interval=30, max_size=None) as ws:
-                log.info("websocket connected")
-                # subscribe to logs (we filter locally)
-                sub = {"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe", "params": ["all", {"commitment": "confirmed"}]}
-                await ws.send(json.dumps(sub))
+                log.info("WS connected")
+                subscribe = {"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe", "params": ["all", {"commitment": "confirmed"}]}
+                await ws.send(json.dumps(subscribe))
                 while True:
                     raw = await ws.recv()
                     try:
@@ -585,32 +506,28 @@ async def websocket_loop():
                     if not params:
                         continue
                     result = params.get("result", {})
-                    # process in background
                     asyncio.create_task(process_logs_result(result))
         except websockets.exceptions.InvalidStatusCode as e:
-            log.error("Websocket invalid status code: %s", e)
+            log.error("InvalidStatusCode: %s", e)
         except Exception as e:
-            log.exception("Websocket error: %s", e)
-        # backoff with jitter
+            log.exception("Websocket loop error: %s", e)
         sleep = min(backoff, 60) + random.random()
-        log.info("reconnect in %.2fs", sleep)
+        log.info("Reconnect in %.2fs", sleep)
         await asyncio.sleep(sleep)
         backoff = min(backoff * 2, 60)
 
 
 # -------------------------
-# Telegram admin poller
+# Admin poller (Telegram getUpdates)
 # -------------------------
 async def process_admin_update(update: Dict[str, Any]):
     try:
         if "message" not in update:
             return
         msg = update["message"]
-        text = msg.get("text", "").strip()
-        chat = msg.get("chat", {})
-        chat_id = str(chat.get("id"))
-        # only allow admin commands from configured admin chat id
-        is_admin = (TELEGRAM_CHAT_ID != "" and chat_id == str(TELEGRAM_CHAT_ID))
+        text = (msg.get("text") or "").strip()
+        chat_id = str(msg.get("chat", {}).get("id"))
+        is_admin = (TELEGRAM_ADMIN_CHAT != "" and chat_id == str(TELEGRAM_ADMIN_CHAT))
         if not text:
             return
         parts = text.split()
@@ -618,44 +535,29 @@ async def process_admin_update(update: Dict[str, Any]):
         if cmd == "/mute" and len(parts) >= 2 and is_admin:
             mint = parts[1].strip()
             db_mute(mint)
-            await telegram_send_raw(f"Muted {mint}")
+            await telegram_send(f"Muted {mint}")
         elif cmd == "/unmute" and len(parts) >= 2 and is_admin:
             mint = parts[1].strip()
             db_unmute(mint)
-            await telegram_send_raw(f"Unmuted {mint}")
+            await telegram_send(f"Unmuted {mint}")
         elif cmd == "/setmincap" and len(parts) >= 2 and is_admin:
             try:
                 v = float(parts[1])
                 db_set_meta("min_marketcap", str(v))
                 global MIN_MARKET_CAP_USD
                 MIN_MARKET_CAP_USD = v
-                await telegram_send_raw(f"MIN_MARKET_CAP_USD set to ${v:,.0f}")
+                await telegram_send(f"MIN_MARKET_CAP_USD set to ${v:,.0f}")
             except Exception:
-                await telegram_send_raw("Usage: /setmincap <usd>")
+                await telegram_send("Usage: /setmincap <usd>")
         elif cmd == "/status":
             muted = db_get_muted_list()
-            count_muted = len(muted)
-            alerts_minute = _alert_counter["count"]
-            msg = f"CDEXSCOPE status\nmuted_tokens: {count_muted}\nmin_marketcap: ${MIN_MARKET_CAP_USD}\nalerts_this_minute: {alerts_minute}"
-            await telegram_send_raw(msg)
-        # add more admin commands as needed
+            s = f"CDEXSCOPE status\nmuted: {len(muted)}\nmin_marketcap: ${MIN_MARKET_CAP_USD}\nalerts_this_minute: {_alert_counter['count']}"
+            await telegram_send(s)
     except Exception as e:
         log.exception("process_admin_update error: %s", e)
 
 
-def db_get_muted_list() -> Set[str]:
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT mint FROM muted_mints")
-    rows = cur.fetchall()
-    conn.close()
-    return set(r[0] for r in rows)
-
-
 async def telegram_poller():
-    """
-    Poll getUpdates and process admin commands, maintaining offset in DB.
-    """
     offset = db_get_meta("tg_offset")
     offset_val = int(offset) if offset else None
     while True:
@@ -664,9 +566,9 @@ async def telegram_poller():
             if not data or not data.get("ok"):
                 await asyncio.sleep(1)
                 continue
-            for update in data.get("result", []):
-                offset_val = max(offset_val or 0, update.get("update_id", 0) + 1)
-                await process_admin_update(update)
+            for upd in data.get("result", []):
+                offset_val = max(offset_val or 0, upd.get("update_id", 0) + 1)
+                await process_admin_update(upd)
             if offset_val:
                 db_set_meta("tg_offset", str(offset_val))
         except Exception as e:
@@ -675,7 +577,7 @@ async def telegram_poller():
 
 
 # -------------------------
-# Minimal HTTP health server (Render)
+# Health server (Render)
 # -------------------------
 async def _handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
@@ -705,11 +607,11 @@ async def start_health_server():
     try:
         server = await asyncio.start_server(_handle_tcp_client, host="0.0.0.0", port=port)
         addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
-        log.info("health server listening on %s", addrs)
+        log.info("Health server listening on %s", addrs)
         async with server:
             await server.serve_forever()
     except Exception as e:
-        log.exception("health server failed: %s", e)
+        log.exception("Health server failed: %s", e)
 
 
 # -------------------------
@@ -718,8 +620,6 @@ async def start_health_server():
 async def main():
     log.info("Starting %s production bot", PROJECT)
     init_db()
-
-    # meta: override min marketcap if stored
     mm = db_get_meta("min_marketcap")
     if mm:
         try:
@@ -727,19 +627,12 @@ async def main():
             MIN_MARKET_CAP_USD = float(mm)
         except Exception:
             pass
-
-    # check tokens
     if not TELEGRAM_TOKEN:
-        log.warning("No TELEGRAM_TOKEN configured - bot will run but cannot send messages")
-    if not TELEGRAM_CHAT_ID:
-        log.warning("No TELEGRAM_CHAT_ID configured - admin commands and messages may not function properly")
-
-    # heartbeat
+        log.warning("TELEGRAM_TOKEN not set. Set in env.")
     try:
-        await telegram_send_raw(f"{PROJECT} started at {datetime.now(timezone.utc).isoformat()}")
+        await telegram_send(f"{PROJECT} started at {datetime.now(timezone.utc).isoformat()}")
     except Exception:
         pass
-
     tasks = [
         asyncio.create_task(websocket_loop()),
         asyncio.create_task(start_health_server()),
@@ -752,4 +645,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("shutdown requested")
+        log.info("Shutdown requested")
