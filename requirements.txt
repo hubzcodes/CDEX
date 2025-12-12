@@ -1,7 +1,7 @@
-python-telegram-bot==13.15
-aiohttp
+python-telegram-bot==20.7
+httpx
 websockets
+aiohttp
 requests
 pydantic
 python-dotenv
-httpx
