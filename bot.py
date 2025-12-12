@@ -1,10 +1,18 @@
-# bot.py
+#!/usr/bin/env python3
 """
-CDEXSCOPE — ALL-IN-ONE production bot (single-file)
-Framework: python-telegram-bot v20 (async)
-Features: Helius WS, DexScreener & Jupiter price, Raydium/Orca LP decoder scaffold,
-Anti-rug heuristics, SQLite persistence, admin commands, webhooks, health server,
-premium message layout, rate-limiting, dedupe, and optional Redis/Postgres scaffolding.
+CDEXSCOPE - single-file production bot (PTB v20 async)
+
+Features:
+- Helius WebSocket (SOL logsSubscribe) with auto-reconnect
+- DexScreener + Jupiter price lookups
+- On-chain LP decoding scaffold (Raydium/Orca heuristics)
+- SQLite persistence (seen_mints, alerts, muted)
+- Telegram (channel + admin) using python-telegram-bot v20 async
+- Rate limiting, dedupe, severity scoring v2
+- Admin commands: /mute, /unmute, /setmincap, /rescan, /stats, /status, /restart
+- Webhook forward (optional)
+- Local health/preview HTTP server (single-file)
+- Safe stubs for Redis/Postgres (no required deps)
 """
 
 import os
@@ -23,18 +31,23 @@ from datetime import datetime, timezone
 import httpx
 import websockets
 
-# python-telegram-bot async API
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TelegramError
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+# telegram
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # -------------------------
 # Configuration (env)
 # -------------------------
 PROJECT = "CDEXSCOPE"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # required
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003312132383")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # REQUIRED
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003312132383")  # your channel id
 TELEGRAM_ADMIN_CHAT = os.getenv("TELEGRAM_ADMIN_CHAT", "8066430050")
 
 HELIUS_KEY = os.getenv("HELIUS_KEY", "")
@@ -51,15 +64,15 @@ ALERTS_PER_MINUTE = int(os.getenv("ALERTS_PER_MINUTE", "6"))
 ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "600"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DB_FILE = os.getenv("CDEX_DB_FILE", "cdexscope.db")
-WEBHOOK_FORWARD_URL = os.getenv("WEBHOOK_FORWARD_URL", "")  # optional endpoint to forward alerts (POST JSON)
+WEBHOOK_FORWARD_URL = os.getenv("WEBHOOK_FORWARD_URL", "")  # optional
 
-# Optional scaling (if provided, code will attempt to use but falls back to local)
+# Optional scaling (stubs)
 REDIS_URL = os.getenv("REDIS_URL", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # Tunables
 MAX_WS_BACKOFF = 60
-RECHECK_INTERVAL_SECONDS = 60  # periodic rechecker interval
+RECHECK_INTERVAL_SECONDS = 60
 RESEND_SEVERITY_INCREASE = 15.0
 
 # -------------------------
@@ -190,56 +203,49 @@ def db_get_recent_alerts(limit: int = 20) -> List[Dict[str, Any]]:
 
 
 # -------------------------
-# Telegram helpers (python-telegram-bot Application)
+# Telegram helpers (PTB v20)
 # -------------------------
-TG_BOT: Optional[Bot] = None  # will be set once app is built
+TG_APP = None  # Application instance will be stored here
 
 
 async def tg_send_text(text: str, chat_id: Optional[str] = None, buttons: Optional[List[Tuple[str, str]]] = None) -> bool:
     """
-    Send message using python-telegram-bot Bot instance asynchronously.
-    Buttons: list of (label, url)
+    Send message using the PTB Application's bot asynchronously.
     """
-    global TG_BOT
-    if TG_BOT is None:
-        log.warning("tg_send_text: TG_BOT not initialized")
+    global TG_APP
+    if TG_APP is None:
+        log.warning("tg_send_text: TG_APP not initialized")
         return False
     target = int(chat_id) if chat_id is not None and str(chat_id).lstrip("-").isdigit() else int(TELEGRAM_CHAT_ID)
-    safe_text = html.escape(text)
-    # build inline keyboard if needed
+    # Message is already HTML formatted; avoid double-escaping so admins can pass <b>/<code> markup.
     reply_markup = None
     if buttons:
         keyboard = [[InlineKeyboardButton(label, url=url)] for label, url in buttons]
         reply_markup = InlineKeyboardMarkup(keyboard)
     try:
-        # python-telegram-bot Bot uses its own escaping when parse_mode=HTML, so send raw HTML content (we escaped above)
-        await TG_BOT.send_message(chat_id=target, text=text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=reply_markup)
+        await TG_APP.bot.send_message(chat_id=target, text=text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=reply_markup)
         log.debug("tg_send_text: sent to %s", target)
         return True
-    except TelegramError as e:
-        log.exception("tg_send_text TelegramError: %s", e)
-        # attempt diagnostic DM to admin
+    except Exception as e:
+        log.exception("tg_send_text failed: %s", e)
+        # send diagnostic to admin if possible
         try:
-            if TELEGRAM_ADMIN_CHAT and target != int(TELEGRAM_ADMIN_CHAT):
-                await TG_BOT.send_message(chat_id=int(TELEGRAM_ADMIN_CHAT), text=f"[CDEXSCOPE DIAG] Failed to send to {target}: {e}")
+            if TELEGRAM_ADMIN_CHAT and int(TELEGRAM_ADMIN_CHAT) != target:
+                await TG_APP.bot.send_message(chat_id=int(TELEGRAM_ADMIN_CHAT), text=f"[CDEXSCOPE DIAG] failed to send to {target}: {e}")
         except Exception:
             log.exception("tg_send_text diag failed")
-        return False
-    except Exception as e:
-        log.exception("tg_send_text exception: %s", e)
         return False
 
 
 # -------------------------
-# HTTP helpers (Option B reading)
+# HTTP helpers
 # -------------------------
 async def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
     client = get_http_client()
     try:
         r = await client.get(url, params=params, timeout=timeout)
-        raw = await r.aread()
-        body = raw.decode("utf-8", errors="ignore")
-        return json.loads(body)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
         log.debug("http_get_json failed %s %s", url, e)
         return None
@@ -320,12 +326,8 @@ async def jupiter_price_in_usdc(mint: str) -> Optional[float]:
 
 
 # -------------------------
-# LP decoders (Raydium & Orca) - FULL SCAFFOLD & conservative decode
+# LP decoders (scaffold)
 # -------------------------
-# NOTE: exact binary Borsh layouts change and are large. This is a robust scaffold:
-# 1) try DexScreener quick lookup
-# 2) try targeted on-chain pool account fetch + decoding heuristics for Raydium/Orca common layouts
-# 3) if no decode, return None
 import base64
 import struct
 
@@ -341,7 +343,6 @@ async def _rpc_get_account_info(pubkey: str) -> Optional[dict]:
 async def _try_decode_pool_from_account_data(b64: str) -> Optional[Dict[str, float]]:
     try:
         raw = base64.b64decode(b64)
-        # Heuristic: search for two contiguous 8-byte unsigned ints (u64) that look like reserves
         L = len(raw)
         for i in range(0, min(128, L - 16), 4):
             try:
@@ -357,11 +358,6 @@ async def _try_decode_pool_from_account_data(b64: str) -> Optional[Dict[str, flo
 
 
 async def get_best_pool_price_and_liquidity_onchain(mint: str) -> Optional[Dict[str, Any]]:
-    """
-    Attempt to decode on-chain pools (Raydium/Orca). This is best-effort and fallback to DexScreener.
-    Returns dict: {"price": float (token price in USD), "liquidity": float (USD)}
-    """
-    # First try DexScreener (fast)
     ds = await dexscreener_for_mint(mint)
     if ds and isinstance(ds, dict) and ds.get("pairs"):
         for p in ds["pairs"]:
@@ -373,19 +369,15 @@ async def get_best_pool_price_and_liquidity_onchain(mint: str) -> Optional[Dict[
             except Exception:
                 continue
 
-    # Fallback: scan a small set of likely pool program accounts -- expensive so we keep it conservative
-    candidates = []  # in a full implementation we'd derive pools referencing the mint
+    candidates = []
     for acct in candidates:
         info = await _rpc_get_account_info(acct)
         if info and info.get("value") and info["value"].get("data"):
             b64 = info["value"]["data"][0]
             decode = await _try_decode_pool_from_account_data(b64)
             if decode:
-                # crude approximation: assume one reserve is token and the other is USDC with 6 decimals
-                # WARNING: this is heuristic and should be replaced by exact program-specific decoding
                 r_a, r_b = decode["reserve_a"], decode["reserve_b"]
                 if r_a > 0 and r_b > 0:
-                    # assume r_b is USDC-like -> token price = r_b / r_a
                     price = r_b / r_a
                     liquidity_usd = (r_b * 1.0)
                     return {"price": float(price), "liquidity": float(liquidity_usd)}
@@ -393,18 +385,21 @@ async def get_best_pool_price_and_liquidity_onchain(mint: str) -> Optional[Dict[
 
 
 # -------------------------
-# Anti-rug heuristics & scoring v2
+# Anti-rug scoring
 # -------------------------
 async def compute_top_holder_pct(mint: str) -> Optional[float]:
     largest = await get_token_largest_accounts(mint)
     supply = await get_token_supply(mint)
     if not largest or not supply:
         return None
-    total_amount = float(supply.get("value", {}).get("amount", 0))
-    top_amount = float(largest[0].get("amount", 0))
-    if total_amount == 0:
+    try:
+        total_amount = float(supply.get("value", {}).get("amount", 0))
+        top_amount = float(largest[0].get("amount", 0))
+        if total_amount == 0:
+            return None
+        return (top_amount / total_amount) * 100.0
+    except Exception:
         return None
-    return (top_amount / total_amount) * 100.0
 
 
 async def approximate_liquidity_usd(mint: str) -> Optional[float]:
@@ -417,7 +412,6 @@ async def approximate_liquidity_usd(mint: str) -> Optional[float]:
                     return float(liq)
                 except Exception:
                     continue
-    # try on-chain pool decode
     oc = await get_best_pool_price_and_liquidity_onchain(mint)
     if oc and oc.get("liquidity"):
         return float(oc["liquidity"])
@@ -496,7 +490,7 @@ def format_premium_message(mint: str, created_iso: Optional[str], mcap: Optional
 
 
 # -------------------------
-# Dedupe and rate limiter
+# Dedupe & rate limiter
 # -------------------------
 _seen_local: Set[str] = set()
 _alerted_cache: Dict[str, float] = {}
@@ -524,7 +518,7 @@ def can_send_alert() -> bool:
 
 
 # -------------------------
-# Webhook forwarder (optional)
+# Webhook forwarder
 # -------------------------
 async def forward_webhook(payload: dict) -> None:
     if not WEBHOOK_FORWARD_URL:
@@ -532,15 +526,13 @@ async def forward_webhook(payload: dict) -> None:
     try:
         client = get_http_client()
         r = await client.post(WEBHOOK_FORWARD_URL, json=payload, timeout=8.0)
-        raw = await r.aread()
-        body = raw.decode("utf-8", errors="ignore")
-        log.info("webhook_forward -> status=%s body=%s", r.status_code, body)
+        log.info("webhook_forward -> status=%s", r.status_code)
     except Exception as e:
         log.exception("forward_webhook failed: %s", e)
 
 
 # -------------------------
-# Core alert analyze pipeline
+# Core analyze pipeline
 # -------------------------
 async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
     try:
@@ -549,10 +541,7 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
             return
 
         created_ts = await infer_creation_ts(mint)
-        if created_ts:
-            db_upsert_seen(mint, created_ts)
-        else:
-            db_upsert_seen(mint, None)
+        db_upsert_seen(mint, created_ts if created_ts else None)
 
         if db_is_muted(mint):
             log.info("mint %s is muted, skip", mint)
@@ -563,16 +552,16 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
         if created_ts:
             age_seconds = int(time.time() - created_ts)
             created_iso = datetime.fromtimestamp(created_ts, tz=timezone.utc).isoformat()
-            if age_seconds > MAX(1, int((os.getenv("MAX_TOKEN_AGE_SECONDS") or 2 * 3600))):
-                log.info("mint %s too old, skip", mint)
+            max_age = int(os.getenv("MAX_TOKEN_AGE_SECONDS", str(2 * 3600)))
+            if age_seconds > max_age:
+                log.info("mint %s older than max_age (%s), skip", mint, age_seconds)
                 return
 
-        # Price/marketcap/liquidity detection pipeline
         mcap = None
         price = None
         liquidity = None
 
-        # 1) Dexscreener
+        # DexScreener
         ds = await dexscreener_for_mint(mint)
         if ds and isinstance(ds, dict) and ds.get("pairs"):
             for p in ds["pairs"]:
@@ -597,7 +586,7 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
                 except Exception:
                     continue
 
-        # 2) Jupiter price -> combine with supply to estimate mcap
+        # Jupiter fallback + supply
         if mcap is None:
             jp = await jupiter_price_in_usdc(mint)
             if jp is not None:
@@ -611,7 +600,7 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
                         mcap = total_supply * jp
                         price = jp
 
-        # 3) On-chain LP decode fallback for price & liquidity
+        # On-chain pool fallback
         if (mcap is None or liquidity is None) and (price is None or liquidity is None):
             oc = await get_best_pool_price_and_liquidity_onchain(mint)
             if oc:
@@ -632,7 +621,7 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
         top_pct = await compute_top_holder_pct(mint)
         sev = severity_score_v2(mcap, liquidity, top_pct, age_seconds)
 
-        # enforce marketcap window requested by you
+        # Marketcap window check
         if mcap is not None:
             if not (MIN_MARKET_CAP_USD <= mcap <= MAX_MARKET_CAP_USD):
                 log.info("mint %s mcap %s outside window %s-%s -> skip", mint, mcap, MIN_MARKET_CAP_USD, MAX_MARKET_CAP_USD)
@@ -649,16 +638,13 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]) -> None:
             risk_label = "MEDIUM"
 
         text, buttons = format_premium_message(mint, created_iso, mcap, price, top_pct, risk_label, sev, triggering_sig)
-
         sent = await tg_send_text(text, chat_id=TELEGRAM_CHAT_ID, buttons=buttons)
-        # record & forward webhook & optionally push to redis/postgres
+
         if sent:
             db_record_alert(mint, sev)
             log.info("alert sent %s sev=%s", mint, sev)
-            # forward to webhook if configured
             payload = {"mint": mint, "mcap": mcap, "price": price, "liquidity": liquidity, "severity": sev, "top_pct": top_pct, "created": created_iso}
             asyncio.create_task(forward_webhook(payload))
-            # TODO: push to redis/postgres for scaling if configured
         else:
             log.warning("failed to send alert for %s", mint)
 
@@ -721,7 +707,7 @@ async def websocket_loop() -> None:
 
 
 # -------------------------
-# Periodic rechecker (resend if severity increases)
+# Periodic rechecker
 # -------------------------
 async def periodic_rechecker() -> None:
     while True:
@@ -733,13 +719,11 @@ async def periodic_rechecker() -> None:
             rows = cur.fetchall()
             conn.close()
             for mint, old_sev, ts in rows:
-                mcap = None
-                liquidity = None
-                top_pct = None
                 created_ts = await infer_creation_ts(mint)
                 age = int(time.time() - created_ts) if created_ts else None
-                # recompute
                 ds = await dexscreener_for_mint(mint)
+                mcap = None
+                liquidity = None
                 if ds and "pairs" in ds and len(ds["pairs"]) > 0:
                     for p in ds["pairs"]:
                         pricep = p.get("priceUsd") or p.get("price")
@@ -766,93 +750,93 @@ async def periodic_rechecker() -> None:
 
 
 # -------------------------
-# Telegram admin polling (getUpdates) & command handlers (for convenience)
+# Telegram admin handlers (PTB command handlers)
 # -------------------------
-async def start_command(update: object, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="CDEXSCOPE bot active.")
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("CDEXSCOPE bot active.")
 
 
-# Using getUpdates polling for admin commands to keep consistent with earlier design
-async def process_admin_update_direct(update: Dict[str, Any]) -> None:
+async def mute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_chat.send_message("Usage: /mute <mint>")
+        return
+    if str(update.effective_chat.id) != str(TELEGRAM_ADMIN_CHAT):
+        await update.effective_chat.send_message("Unauthorized.")
+        return
+    mint = context.args[0].strip()
+    db_mute(mint)
+    await update.effective_chat.send_message(f"Muted {mint}")
+
+
+async def unmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_chat.send_message("Usage: /unmute <mint>")
+        return
+    if str(update.effective_chat.id) != str(TELEGRAM_ADMIN_CHAT):
+        await update.effective_chat.send_message("Unauthorized.")
+        return
+    mint = context.args[0].strip()
+    db_unmute(mint)
+    await update.effective_chat.send_message(f"Unmuted {mint}")
+
+
+async def setmincap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_chat.send_message("Usage: /setmincap <usd>")
+        return
+    if str(update.effective_chat.id) != str(TELEGRAM_ADMIN_CHAT):
+        await update.effective_chat.send_message("Unauthorized.")
+        return
     try:
-        if "message" not in update:
-            return
-        msg = update["message"]
-        text = (msg.get("text") or "").strip()
-        if not text:
-            return
-        chat_id = str(msg.get("chat", {}).get("id"))
-        is_admin = (TELEGRAM_ADMIN_CHAT != "" and chat_id == str(TELEGRAM_ADMIN_CHAT))
-        parts = text.split()
-        cmd = parts[0].lower()
-        if cmd == "/mute" and len(parts) >= 2 and is_admin:
-            mint = parts[1].strip()
-            db_mute(mint)
-            await tg_send_text(f"Muted {mint}", chat_id=chat_id)
-        elif cmd == "/unmute" and len(parts) >= 2 and is_admin:
-            mint = parts[1].strip()
-            db_unmute(mint)
-            await tg_send_text(f"Unmuted {mint}", chat_id=chat_id)
-        elif cmd == "/setmincap" and len(parts) >= 2 and is_admin:
-            try:
-                v = float(parts[1])
-                db_set_meta("min_marketcap", str(v))
-                global MIN_MARKET_CAP_USD
-                MIN_MARKET_CAP_USD = v
-                await tg_send_text(f"MIN_MARKET_CAP_USD set to ${v:,.0f}", chat_id=chat_id)
-            except Exception:
-                await tg_send_text("Usage: /setmincap <usd>", chat_id=chat_id)
-        elif cmd == "/rescan" and len(parts) >= 2 and is_admin:
-            mint = parts[1].strip()
-            asyncio.create_task(analyze_and_alert(mint, None))
-            await tg_send_text(f"Rescan queued for {mint}", chat_id=chat_id)
-        elif cmd == "/stats" and is_admin:
-            conn = sqlite3.connect(DB_FILE, timeout=30)
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM seen_mints")
-            seen = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM alerts WHERE ts > ?", (int(time.time()) - 3600,))
-            recent_alerts = cur.fetchone()[0]
-            conn.close()
-            await tg_send_text(f"Stats: seen tokens={seen}, alerts_last_hour={recent_alerts}", chat_id=chat_id)
-        elif cmd == "/status":
-            muted = db_get_meta("muted_list")  # optional
-            await tg_send_text(f"CDEXSCOPE status\nmin_marketcap={MIN_MARKET_CAP_USD}\nalerts_this_minute={_alert_counter['count']}")
-        elif cmd == "/restart" and is_admin:
-            await tg_send_text("Restarting (admin requested)...", chat_id=chat_id)
-            os._exit(0)
-    except Exception as e:
-        log.exception("process_admin_update_direct error: %s", e)
+        v = float(context.args[0])
+        db_set_meta("min_marketcap", str(v))
+        global MIN_MARKET_CAP_USD
+        MIN_MARKET_CAP_USD = v
+        await update.effective_chat.send_message(f"MIN_MARKET_CAP_USD set to ${v:,.0f}")
+    except Exception:
+        await update.effective_chat.send_message("Invalid value")
 
 
-async def telegram_poller_getupdates():
-    offset = db_get_meta("tg_offset")
-    offset_val = int(offset) if offset else None
-    client = get_http_client()
-    while True:
-        try:
-            params = {}
-            if offset_val:
-                params["offset"] = offset_val
-            r = await client.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", params=params, timeout=8.0)
-            raw = await r.aread()
-            body = raw.decode("utf-8", errors="ignore")
-            data = json.loads(body)
-            if not data.get("ok"):
-                await asyncio.sleep(1)
-                continue
-            for upd in data.get("result", []):
-                offset_val = max(offset_val or 0, upd.get("update_id", 0) + 1)
-                await process_admin_update_direct(upd)
-            if offset_val:
-                db_set_meta("tg_offset", str(offset_val))
-        except Exception as e:
-            log.exception("telegram_poller_getupdates error: %s", e)
-            await asyncio.sleep(1)
+async def rescan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_chat.send_message("Usage: /rescan <mint>")
+        return
+    if str(update.effective_chat.id) != str(TELEGRAM_ADMIN_CHAT):
+        await update.effective_chat.send_message("Unauthorized.")
+        return
+    mint = context.args[0].strip()
+    asyncio.create_task(analyze_and_alert(mint, None))
+    await update.effective_chat.send_message(f"Rescan queued for {mint}")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != str(TELEGRAM_ADMIN_CHAT):
+        await update.effective_chat.send_message("Unauthorized.")
+        return
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM seen_mints")
+    seen = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM alerts WHERE ts > ?", (int(time.time()) - 3600,))
+    recent_alerts = cur.fetchone()[0]
+    conn.close()
+    await update.effective_chat.send_message(f"Stats: seen tokens={seen}, alerts_last_hour={recent_alerts}")
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(f"CDEXSCOPE status\nmin_marketcap={MIN_MARKET_CAP_USD}\nalerts_this_minute={_alert_counter['count']}")
+
+
+async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != str(TELEGRAM_ADMIN_CHAT):
+        await update.effective_chat.send_message("Unauthorized.")
+        return
+    await update.effective_chat.send_message("Restarting (admin requested)...")
+    os._exit(0)
 
 
 # -------------------------
-# Simple embedded HTML preview endpoint (tiny dashboard)
+# Tiny HTTP preview (health + recent alerts)
 # -------------------------
 async def _handle_http_preview(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
@@ -867,6 +851,7 @@ async def _handle_http_preview(reader: asyncio.StreamReader, writer: asyncio.Str
         <body>
         <h1>CDEXSCOPE - Recent Alerts</h1>
         <table border="1" cellpadding="6"><thead><tr><th>Mint</th><th>Severity</th><th>Time</th></tr></thead><tbody>{rows}</tbody></table>
+        <p>Instance healthy.</p>
         </body></html>
         """
         resp = (
@@ -897,37 +882,39 @@ async def start_preview_server():
 
 
 # -------------------------
-# Entrypoint: build python-telegram-bot Application and launch tasks
+# Entrypoint
 # -------------------------
 async def main() -> None:
-    global TG_BOT
-    log.info("Starting %s FULL single-file bot", PROJECT)
+    global TG_APP
+    log.info("Starting %s single-file bot", PROJECT)
     init_db()
-    # load stored min cap override if present
-    mm = db_get_meta("min_marketcap")
-    if mm:
-        try:
-            global MIN_MARKET_CAP_USD
-            MIN_MARKET_CAP_USD = float(mm)
-        except Exception:
-            pass
 
-    # Build python-telegram-bot Application (async)
+    # PTB Application
     if TELEGRAM_TOKEN:
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
-        TG_BOT = app.bot
-        # add a simple /start handler
-        app.add_handler(CommandHandler("start", start_command))
-        # start the bot in background
-        asyncio.create_task(app.initialize())
-        asyncio.create_task(app.start())
-        # note: we do not call app.run_polling() since we are already using background tasks
+        TG_APP = app
+
+        # command handlers
+        app.add_handler(CommandHandler("start", start_cmd))
+        app.add_handler(CommandHandler("mute", mute_cmd))
+        app.add_handler(CommandHandler("unmute", unmute_cmd))
+        app.add_handler(CommandHandler("setmincap", setmincap_cmd))
+        app.add_handler(CommandHandler("rescan", rescan_cmd))
+        app.add_handler(CommandHandler("stats", stats_cmd))
+        app.add_handler(CommandHandler("status", status_cmd))
+        app.add_handler(CommandHandler("restart", restart_cmd))
+
+        # start app in background
+        await app.initialize()
+        await app.start()
+        log.info("Telegram application started")
     else:
-        log.warning("TELEGRAM_TOKEN not set; bot will run but cannot send messages or accept admin commands")
+        log.warning("TELEGRAM_TOKEN not set; Telegram functionality disabled")
+        TG_APP = None
 
     # startup heartbeat
     try:
-        if TELEGRAM_TOKEN:
+        if TG_APP:
             await tg_send_text(f"{PROJECT} started at {datetime.now(timezone.utc).isoformat()}")
     except Exception:
         log.exception("startup heartbeat failed")
@@ -936,9 +923,10 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(websocket_loop()),
         asyncio.create_task(periodic_rechecker()),
-        asyncio.create_task(telegram_poller_getupdates()),
         asyncio.create_task(start_preview_server()),
     ]
+    # if telegram polling getUpdates needed, we have admin handlers in PTB, no extra poller required
+
     await asyncio.gather(*tasks)
 
 
