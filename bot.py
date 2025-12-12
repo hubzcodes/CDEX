@@ -1,24 +1,24 @@
 # bot.py
 """
-CDEXSCOPE — production-grade single-file bot.
+CDEXSCOPE - production-grade single-file Solana memecoin monitor.
 
-Drop this file into your repo and deploy to Render (or run locally).
-Set TELEGRAM_TOKEN in environment before running.
+Drop this into your repo, set environment variables on Render, and deploy.
 
-Environment variables (recommended to set in Render):
-- TELEGRAM_TOKEN (required)
-- TELEGRAM_CHAT_ID (default set below to your channel: -1003312132383)
-- TELEGRAM_ADMIN_CHAT (default your DM admin: 8066430050)
-- HELIUS_KEY (recommended)
-- SOLANA_WS_URL (optional; defaults to Helius)
-- SOLANA_RPC_URL (optional; defaults to Helius)
-- MIN_MARKET_CAP_USD (optional)
-- MAX_TOKEN_AGE_SECONDS (optional)
-- ALERTS_PER_MINUTE (optional)
-- ALERT_DEDUPE_SECONDS (optional)
-- LOG_LEVEL (optional, DEBUG/INFO)
-- CDEX_DB_FILE (optional)
+Env vars (set in Render):
+- TELEGRAM_TOKEN         (required)
+- TELEGRAM_CHAT_ID       (channel id, default -1003312132383)
+- TELEGRAM_ADMIN_CHAT    (admin DM id, default 8066430050)
+- HELIUS_KEY             (recommended)
+- SOLANA_WS_URL          (optional; defaults to helius with HELIUS_KEY)
+- SOLANA_RPC_URL         (optional; defaults to helius with HELIUS_KEY)
+- MIN_MARKET_CAP_USD     (optional)
+- MAX_TOKEN_AGE_SECONDS  (optional)
+- ALERTS_PER_MINUTE      (optional)
+- ALERT_DEDUPE_SECONDS   (optional)
+- LOG_LEVEL              (optional, DEBUG/INFO)
+- CDEX_DB_FILE           (optional; default cdexscope.db)
 """
+
 import os
 import sys
 import time
@@ -36,16 +36,13 @@ import httpx
 import websockets
 
 # -------------------------
-# Configuration defaults
+# Configuration / defaults
 # -------------------------
 PROJECT = "CDEXSCOPE"
 
-# Secrets — set TELEGRAM_TOKEN in Render
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # REQUIRED
-# Default to your provided channel id — change in env if you want notifications somewhere else
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003312132383")
-# Admin who can run /mute /unmute /setmincap — default to the DM id you gave earlier
-TELEGRAM_ADMIN_CHAT = os.getenv("TELEGRAM_ADMIN_CHAT", "8066430050")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003312132383")  # YOUR CHANNEL (defaulted)
+TELEGRAM_ADMIN_CHAT = os.getenv("TELEGRAM_ADMIN_CHAT", "8066430050")  # your admin DM (defaulted)
 
 HELIUS_KEY = os.getenv("HELIUS_KEY", "")
 SOLANA_WS_URL = os.getenv("SOLANA_WS_URL", f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}")
@@ -54,13 +51,11 @@ SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", f"https://mainnet.helius-rpc.com/?a
 JUPITER_PRICE_API = os.getenv("JUPITER_PRICE_API", "https://quote-api.jup.ag/v1/price")
 USDC_MINT = os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1zN7K4m3o8fM7k8UXfJv")
 
-# Tunables
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "50000"))
 MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", str(2 * 3600)))
 ALERTS_PER_MINUTE = int(os.getenv("ALERTS_PER_MINUTE", "6"))
 ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", "600"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-
 DB_FILE = os.getenv("CDEX_DB_FILE", "cdexscope.db")
 
 # -------------------------
@@ -74,7 +69,7 @@ logging.basicConfig(
 log = logging.getLogger(PROJECT)
 
 # -------------------------
-# httpx Async client
+# HTTP client
 # -------------------------
 _http_client: Optional[httpx.AsyncClient] = None
 
@@ -190,34 +185,68 @@ def db_get_muted_list() -> Set[str]:
 
 
 # -------------------------
-# Telegram helpers (safe)
+# Telegram send with diagnostics
 # -------------------------
-async def telegram_send(text: str) -> bool:
+async def telegram_send(text: str, chat_id: Optional[str] = None) -> bool:
     """
-    HTML-escape and send to TELEGRAM_CHAT_ID (the channel by default)
-    Retries and logs failures.
+    Send message (HTML-escaped) to channel by default.
+    Logs full Telegram response and attempts a diagnostic DM to admin on failure.
     """
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured (TELEGRAM_TOKEN/TELEGRAM_CHAT_ID).")
+    if not TELEGRAM_TOKEN:
+        log.warning("telegram_send: TELEGRAM_TOKEN not set; abort.")
         return False
 
+    target = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
+    if not target:
+        log.warning("telegram_send: no target chat id.")
+        return False
+
+    # normalize chat id type
+    try:
+        payload_chat = int(target) if isinstance(target, str) and target.lstrip("-").isdigit() else target
+    except Exception:
+        payload_chat = target
+
     safe = html.escape(text)
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": safe, "parse_mode": "HTML"}
+    payload = {"chat_id": payload_chat, "text": safe, "parse_mode": "HTML"}
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     client = get_http_client()
-    for attempt in range(3):
-        try:
-            r = await client.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload)
-            if r.status_code == 200:
-                return True
-            else:
-                body = await r.aread()
-                log.warning("telegram_send failed status=%s body=%s", r.status_code, body)
-        except Exception as e:
-            log.exception("telegram_send exception: %s", e)
-        await asyncio.sleep(1 + attempt * 2)
-    return False
+
+    try:
+        r = await client.post(url, json=payload, timeout=10.0)
+        body_text = await r.text()
+        log.info("telegram_send -> chat=%s status=%s body=%s", target, r.status_code, body_text)
+        if r.status_code == 200:
+            return True
+
+        # diagnostic: try to notify admin DM so you see why channel failed
+        if TELEGRAM_ADMIN_CHAT and str(target) != str(TELEGRAM_ADMIN_CHAT):
+            try:
+                diag_text = f"[CDEXSCOPE DIAG] failed to post to {target} (status={r.status_code}) body: {body_text}"
+                diag_payload = {"chat_id": int(TELEGRAM_ADMIN_CHAT), "text": html.escape(diag_text), "parse_mode": "HTML"}
+                r2 = await client.post(url, json=diag_payload, timeout=8.0)
+                diag_body = await r2.text()
+                log.info("telegram_send diag -> admin=%s status=%s body=%s", TELEGRAM_ADMIN_CHAT, r2.status_code, diag_body)
+            except Exception as e:
+                log.exception("telegram_send diag error: %s", e)
+        return False
+    except Exception as e:
+        log.exception("telegram_send exception: %s", e)
+        # try admin fallback
+        if TELEGRAM_ADMIN_CHAT:
+            try:
+                diag_payload = {"chat_id": int(TELEGRAM_ADMIN_CHAT), "text": html.escape(f"[CDEXSCOPE EXC] {e}"), "parse_mode": "HTML"}
+                r3 = await client.post(url, json=diag_payload, timeout=8.0)
+                diag_b = await r3.text()
+                log.info("telegram_send diag2 -> admin=%s status=%s body=%s", TELEGRAM_ADMIN_CHAT, r3.status_code, diag_b)
+            except Exception:
+                log.exception("telegram_send diag2 failed")
+        return False
 
 
+# -------------------------
+# Telegram getUpdates for admin commands
+# -------------------------
 async def telegram_get_updates(offset: Optional[int] = None) -> Dict[str, Any]:
     if not TELEGRAM_TOKEN:
         return {}
@@ -235,7 +264,7 @@ async def telegram_get_updates(offset: Optional[int] = None) -> Dict[str, Any]:
 
 
 # -------------------------
-# Rate limiting + counters
+# Rate limiting
 # -------------------------
 _alert_counter = {"minute": None, "count": 0}
 
@@ -308,7 +337,7 @@ async def infer_creation_ts(mint: str) -> Optional[int]:
 
 
 # -------------------------
-# Price & marketcap estimation
+# Price & marketcap (Jupiter primary)
 # -------------------------
 async def jupiter_price_in_usdc(mint: str) -> Optional[float]:
     try:
@@ -321,13 +350,12 @@ async def jupiter_price_in_usdc(mint: str) -> Optional[float]:
         price = data.get("price") or data.get("data", {}).get("price")
         if price:
             return float(price)
-    except Exception:
-        return None
+    except Exception as e:
+        log.debug("jupiter_price error: %s", e)
     return None
 
 
 async def estimate_marketcap_usd(mint: str) -> Optional[float]:
-    # supply
     supply_res = await get_token_supply(mint)
     if not supply_res:
         return None
@@ -336,24 +364,22 @@ async def estimate_marketcap_usd(mint: str) -> Optional[float]:
     decimals = int(val.get("decimals") or 0)
     total_supply = amount / (10 ** decimals) if decimals else amount
 
-    # price via Jupiter
     price = await jupiter_price_in_usdc(mint)
     if price:
         return total_supply * price
 
-    # fallback placeholder (on-chain LP parsing not implemented here)
+    # fallback: on-chain LP parsing (placeholder)
+    # TODO: implement Raydium/Orca LP parsing for robust on-chain price
     return None
 
 
 # -------------------------
-# Anti-rug heuristics & scoring
+# Anti-rug heuristics + scoring
 # -------------------------
 async def compute_top_holder_pct(mint: str) -> Optional[float]:
     largest = await get_token_largest_accounts(mint)
-    if not largest:
-        return None
     supply = await get_token_supply(mint)
-    if not supply:
+    if not largest or not supply:
         return None
     total_amount = float(supply.get("value", {}).get("amount", 0))
     top_amount = float(largest[0].get("amount", 0))
@@ -464,7 +490,7 @@ async def analyze_and_alert(mint: str, triggering_sig: Optional[str]):
 
 
 # -------------------------
-# Websocket processing
+# Websocket processing (logsSubscribe -> filter local)
 # -------------------------
 async def process_logs_result(result: Dict[str, Any]):
     try:
@@ -518,7 +544,7 @@ async def websocket_loop():
 
 
 # -------------------------
-# Admin poller (Telegram getUpdates)
+# Telegram admin poller
 # -------------------------
 async def process_admin_update(update: Dict[str, Any]):
     try:
@@ -535,24 +561,24 @@ async def process_admin_update(update: Dict[str, Any]):
         if cmd == "/mute" and len(parts) >= 2 and is_admin:
             mint = parts[1].strip()
             db_mute(mint)
-            await telegram_send(f"Muted {mint}")
+            await telegram_send(f"Muted {mint}", chat_id=chat_id if is_admin else None)
         elif cmd == "/unmute" and len(parts) >= 2 and is_admin:
             mint = parts[1].strip()
             db_unmute(mint)
-            await telegram_send(f"Unmuted {mint}")
+            await telegram_send(f"Unmuted {mint}", chat_id=chat_id if is_admin else None)
         elif cmd == "/setmincap" and len(parts) >= 2 and is_admin:
             try:
                 v = float(parts[1])
                 db_set_meta("min_marketcap", str(v))
                 global MIN_MARKET_CAP_USD
                 MIN_MARKET_CAP_USD = v
-                await telegram_send(f"MIN_MARKET_CAP_USD set to ${v:,.0f}")
+                await telegram_send(f"MIN_MARKET_CAP_USD set to ${v:,.0f}", chat_id=chat_id)
             except Exception:
-                await telegram_send("Usage: /setmincap <usd>")
+                await telegram_send("Usage: /setmincap <usd>", chat_id=chat_id)
         elif cmd == "/status":
             muted = db_get_muted_list()
             s = f"CDEXSCOPE status\nmuted: {len(muted)}\nmin_marketcap: ${MIN_MARKET_CAP_USD}\nalerts_this_minute: {_alert_counter['count']}"
-            await telegram_send(s)
+            await telegram_send(s, chat_id=chat_id)
     except Exception as e:
         log.exception("process_admin_update error: %s", e)
 
@@ -577,7 +603,7 @@ async def telegram_poller():
 
 
 # -------------------------
-# Health server (Render)
+# Health server
 # -------------------------
 async def _handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
@@ -627,12 +653,16 @@ async def main():
             MIN_MARKET_CAP_USD = float(mm)
         except Exception:
             pass
+
     if not TELEGRAM_TOKEN:
         log.warning("TELEGRAM_TOKEN not set. Set in env.")
+
+    # Startup heartbeat to channel (diagnostic) - will post into your channel on deploy
     try:
         await telegram_send(f"{PROJECT} started at {datetime.now(timezone.utc).isoformat()}")
     except Exception:
-        pass
+        log.exception("startup heartbeat failed")
+
     tasks = [
         asyncio.create_task(websocket_loop()),
         asyncio.create_task(start_health_server()),
