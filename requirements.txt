@@ -1,5 +1,5 @@
 python-telegram-bot==20.7
-aiohttp==3.8.4
+aiohttp==3.8.6
 websockets==11.0.3
 httpx==0.25.2
 pydantic==1.10.7
